@@ -2,7 +2,7 @@
 
 > Mọi con số lấy từ report JSON trong `reports/` (load test, eval) và CSV trong `benchmark-results/` (Locust).
 
-**Họ tên:** Do Phuong Nam — 2A202603621
+**Họ tên:** Đỗ Phương Nam — 2A202603621
 **Ngày chạy:** 2026-11-25
 **Môi trường:** Laptop Windows 11 Home, Intel Core i7-9750H (6 nhân / 12 luồng, 2.6 GHz), RAM 32 GB, Python 3.14.6 (venv), Docker Desktop 29.5.2 (WSL2). Load generator (`load_test.py`) và agent chạy trên **cùng một máy**, agent là 1 process uvicorn (1 event loop).
 
