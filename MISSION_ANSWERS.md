@@ -230,6 +230,58 @@ Header `Server: nginx` và các security header chứng tỏ request đi qua ngi
 
 Dọn stack: `docker compose -p k5-day14-docker down`.
 
+## Part 3: Cloud Deployment
+
+> Theo lộ trình K5, Part 3 làm sau Part 6 và deploy chính agent Part 6 (`06-lab-complete/`). Chi tiết: [DEPLOYMENT.md](DEPLOYMENT.md).
+
+### Exercise 3.1 / 3.2: Deploy
+
+- **Railway (3.1), đã thử:** cài Railway CLI 5.75.0, `railway login` thành công, nhưng `railway init --name day14-agent` báo *"Your trial has expired. Please select a plan to continue using Railway."* Tài khoản hết hạn dùng thử nên không tạo được project nếu không lên gói trả phí.
+- **Render (3.2), nền tảng chính:** Blueprint `06-lab-complete/render.yaml` tạo 2 tài nguyên Free: web service `day14-agent` (Docker) và Key Value `day14-redis`.
+- **URL:** https://day14-agent-l0rz.onrender.com
+- **Screenshot:** [dashboard](screenshots/dashboard.png) · [running](screenshots/running.png) · [test](screenshots/test.png)
+
+```text
+$ curl https://day14-agent-l0rz.onrender.com/health
+{"status":"ok","version":"1.0.0","environment":"production","uptime_seconds":137.7}
+$ curl https://day14-agent-l0rz.onrender.com/ready
+{"ready":true}
+$ curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE/ask" -H 'Content-Type: application/json' -d '{"question":"Hello"}'
+401
+$ curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$BASE/ask" -H 'Content-Type: application/json' -H "X-API-Key: $AGENT_API_KEY" -d '{"question":"Hello"}'
+200
+```
+
+4 lệnh tự kiểm CP6: `200 200 401 200` ([test.png](screenshots/test.png)). `AGENT_API_KEY` do Render sinh (`generateValue: true`), `REDIS_URL` lấy từ Key Value `day14-redis` (`fromService`), không có giá trị nào trong code.
+
+### So sánh `railway.toml` và `render.yaml` (nền tảng còn lại)
+
+So sánh hai file đã viết cho agent Part 6: [`06-lab-complete/railway.toml`](06-lab-complete/railway.toml) và [`06-lab-complete/render.yaml`](06-lab-complete/render.yaml).
+
+| Khía cạnh | `railway.toml` | `render.yaml` | Vì sao khác |
+|---|---|---|---|
+| Phạm vi | Config **một service** (build + deploy). Project, Redis, domain tạo bằng CLI/dashboard (`railway init`, `railway add --database redis`, `railway domain`) | **Blueprint cả hạ tầng**: web service + Key Value Redis + biến môi trường + liên kết giữa chúng, trong một file | Railway chọn "config-as-code cho service, hạ tầng thao tác bằng CLI"; Render chọn Infrastructure-as-Code đầy đủ, tạo lại được toàn bộ stack từ file |
+| Build | `builder = "DOCKERFILE"`, `dockerfilePath` | `runtime: docker`, `rootDir`, `dockerContext`, `dockerfilePath` | Render đọc Blueprint từ repo nên cần `rootDir` để biết app nằm trong `06-lab-complete/`; Railway thì `railway up` upload thẳng thư mục hiện tại |
+| Health check | `[deploy] healthcheckPath = "/health"`, `healthcheckTimeout = 100` | `healthCheckPath: /health` | Giống nhau về ý nghĩa: deploy mới chỉ nhận traffic khi `/health` trả 200 (zero-downtime) |
+| Restart | `restartPolicyType = "ON_FAILURE"`, `restartPolicyMaxRetries = 3` | Không khai báo, Render tự restart | Railway cho chỉnh chính sách restart; Render quản lý ngầm |
+| Secret | **Không ghi trong file**, đặt bằng `railway variables` / dashboard; Redis tham chiếu bằng `${{Redis.REDIS_URL}}` | Khai báo **tên** biến trong file nhưng không ghi giá trị: `generateValue: true` (Render tự sinh `AGENT_API_KEY`), hoặc `sync: false` (nhập tay) | Render muốn file mô tả đủ hạ tầng nên có cơ chế riêng để khai báo secret mà không lộ giá trị |
+| Redis | Thêm bằng lệnh `railway add --database redis`, nối qua reference variable | Khai báo `type: keyvalue` ngay trong file, `REDIS_URL` lấy bằng `fromService ... property: connectionString`, `ipAllowList: []` (chỉ nội bộ) | Cùng mục tiêu: agent không hardcode địa chỉ Redis |
+| PORT | Railway inject `PORT`; Dockerfile `CMD` dùng `${PORT:-8000}` | Render inject `PORT` (mặc định 10000), cùng `CMD` đó | Một Dockerfile chạy được ở cả hai nhờ đọc `PORT` từ env (12-factor) |
+| Plan / region | Chọn trên dashboard | `plan: free`, `region: singapore` trong file | Render đưa cả quy mô, vị trí vào IaC |
+
+**Tóm lại:** `railway.toml` ngắn vì chỉ mô tả *cách build/chạy một service*, phần còn lại làm bằng CLI; `render.yaml` dài hơn vì mô tả *toàn bộ hạ tầng* (service + database + nối dây + secret) để Render dựng lại y hệt từ Git. Cả hai đều không chứa giá trị secret, đều dùng chung một Dockerfile.
+
+### Exercise 3.3: Cloud Run CI/CD (`03-cloud-deployment/production-cloud-run/`)
+
+`cloudbuild.yaml` là pipeline Cloud Build chạy khi push lên `main`, gồm 4 bước nối tiếp nhau (`waitFor`):
+1. **test**: trong image `python:3.11-slim`, cài `requirements.txt` + `pytest` rồi chạy `pytest tests/`; test fail thì dừng pipeline, không build.
+2. **build**: `docker build` gắn 2 tag `gcr.io/$PROJECT_ID/ai-agent:$COMMIT_SHA` và `:latest`, dùng `--cache-from ...:latest` để tận dụng layer cache.
+3. **push**: đẩy cả hai tag lên Container Registry.
+4. **deploy**: `gcloud run deploy ai-agent` với image tag `$COMMIT_SHA` (mỗi bản deploy truy được về đúng commit, dễ rollback), region `asia-southeast1`, `--min-instances=1` (tránh cold start), `--max-instances=10`, 512Mi / 1 CPU, `ENVIRONMENT=production`, và `OPENAI_API_KEY` lấy từ **Secret Manager** (`--set-secrets`), không nằm trong code.
+
+`service.yaml` mô tả cùng service dưới dạng Knative (IaC, áp dụng bằng `gcloud run services replace`): autoscale 1–10 instance, mỗi instance tối đa 80 request đồng thời (`containerConcurrency: 80`), timeout 60 s, `livenessProbe` gọi `/health`, `startupProbe` gọi `/ready`, secret `OPENAI_API_KEY` / `AGENT_API_KEY` lấy qua `secretKeyRef`.
+
+
 ## Part 4: API Security
 
 ### Exercise 4.1: API Key authentication (`04-api-gateway/develop/app.py`)
@@ -504,3 +556,67 @@ Nginx log: `connect() failed (113: Host is unreachable) while connecting to upst
 - **Nhưng có 1 request chậm 38,9 giây:** Nginx vẫn round-robin vào IP của container đã tắt, chờ connect timeout rồi mới `proxy_next_upstream` sang instance khác. Request không lỗi (vẫn 200) nhưng người dùng phải chờ gần 40 giây. Cách giảm: đặt `proxy_connect_timeout 2s;` và `server agent:8000 max_fails=1 fail_timeout=10s;` để Nginx loại instance chết ngay sau lần lỗi đầu. Load balancer thật (K8s Service, Railway, Render) dùng readiness probe để loại instance trước khi gửi traffic.
 
 Dọn stack: `docker compose -p k5-day14-scaling down`.
+
+## Part 6: Final Project (`06-lab-complete/`)
+
+Đã làm hết các TODO theo thứ tự gợi ý trong `06-lab-complete/README.md`:
+
+| File | Nội dung |
+|---|---|
+| `app/config.py` | Đọc `PORT`, `ENVIRONMENT`, `AGENT_API_KEY`, `REDIS_URL`, `RATE_LIMIT_PER_MINUTE`, `DAILY_BUDGET_USD`, `MONTHLY_BUDGET_USD`, `LOG_LEVEL`, `APP_VERSION` từ env; `ENVIRONMENT=production` mà thiếu key thì dừng ngay lúc khởi động |
+| `app/auth.py` | `X-API-Key` so sánh bằng `hmac.compare_digest`; thiếu / sai / chưa cấu hình key → 401 |
+| `app/redis_client.py` | Client lazy (không ping lúc import → app vẫn lên khi chưa có Redis), timeout 1–2 s để `/ready` trả 503 nhanh |
+| `app/rate_limiter.py` | Sliding window log bằng sorted set trong Redis, chạy trong Lua script (atomic giữa nhiều worker / instance) → 429 + `Retry-After` |
+| `app/cost_guard.py` | Cộng chi phí theo ngày + tháng vào Redis (key theo ngày/tháng, có TTL) → 402 khi hết budget |
+| `app/main.py` | `/health` (luôn 200), `/ready` (503 khi mất Redis / đang tắt), log JSON một object mỗi dòng, lifespan shutdown (không đè signal handler của uvicorn), Redis lỗi → 503, lỗi lạ → 500 không lộ stack trace |
+| `Dockerfile` | Multi-stage (venv ở builder), `python:3.11-slim`, user `app` non-root, `HEALTHCHECK`, `CMD sh -c "exec uvicorn ... --port ${PORT:-8000}"` → uvicorn là PID 1. Image **182.9 MB** |
+| `docker-compose.yml`, `.dockerignore`, `.env.example`, `railway.toml`, `render.yaml` | Đủ theo hợp đồng chấm |
+
+**Kết quả `check_production_ready.py`** (chạy đầy đủ, không cờ, trong **Ubuntu 24.04 trên WSL2**, Python 3.12.3, `os.name = posix`, Docker Desktop 29.5.2 bật WSL integration):
+
+```text
+$ cd 06-lab-complete && python check_production_ready.py
+...
+✅ 11. Graceful shutdown
+     ✅ Code xử lý SIGTERM / lifespan shutdown
+     ✅ Khi chạy: SIGTERM lúc đang có request → request vẫn 200, process tự thoát — exit code 0
+     ✅ Docker: `docker stop` tắt êm (exit code 0, < 10s) — exit code 0, 0.7s
+...
+================================================================
+  📋 Checklist Deliverable
+     ✅ Dockerfile (multi-stage, < 500 MB)
+     ✅ docker-compose.yml (agent + redis)
+     ✅ .dockerignore
+     ✅ Health check endpoint (GET /health)
+     ✅ Readiness endpoint (GET /ready)
+     ✅ API Key authentication
+     ✅ Rate limiting
+     ✅ Cost guard
+     ✅ Config từ environment variables
+     ✅ Structured logging
+     ✅ Graceful shutdown
+     ✅ Public URL ready (Railway / Render config)
+----------------------------------------------------------------
+  Result: 12/12 tiêu chí đạt · 43/43 checks passed
+  🎉 PASS 12/12 — PRODUCTION READY! Deploy nào!
+================================================================
+```
+
+Một số dòng chi tiết từ cùng lần chạy: image build 153 s, **183 MB**; `429 sau 5 request thành công (RATE_LIMIT_PER_MINUTE=5)` với 2 worker (rate limit dùng chung qua Redis); restart agent vẫn 429 (stateless); Redis mất kết nối → `/ready` 503, `/health` 200; budget ≈ 0 → `402 ở request thứ 1`; 15 dòng log JSON hợp lệ.
+
+Trước đó, chạy trên Windows (Python cho Windows) cho 11/12 vì tiêu chí 11 báo ⚠️ *"Windows không gửi được SIGTERM"*, đúng như lưu ý số 2 trong README. Ngoài ra `--public-url https://day14-agent-l0rz.onrender.com` → ✅ `GET /health → 200`.
+
+## AI log
+
+Toàn bộ bài làm với sự hỗ trợ của **Claude Code** (Anthropic) chạy trong VS Code, trên máy và tài khoản của tôi. Claude đọc đề, chạy lệnh, viết code và báo cáo; tôi duyệt từng checkpoint trước khi đi tiếp, tự đăng nhập các dịch vụ và tự chụp màn hình.
+
+| Phần | Tôi yêu cầu | AI làm / đề xuất | Tôi kiểm tra / tự làm |
+|---|---|---|---|
+| CP0 | Tóm tắt đề, kiểm tra môi trường | Phát hiện Docker Hub hết lượt pull ẩn danh và thiếu Ubuntu WSL (ảnh hưởng tiêu chí 11); sau đó cài Ubuntu 24.04 (`wsl --install --no-launch`) và venv trong đó | Tự `docker login`, tự bật WSL integration trong Docker Desktop |
+| Part 1, 2, 4, 5 | Chạy ví dụ và trả lời câu hỏi | Chạy app/container/stack, đo image, gửi request, viết câu trả lời từ output thật; phát hiện lỗi encoding cp1252 trên Windows, thứ tự `logging.basicConfig`, độ trễ 39 s khi 1 instance chết sau Nginx | Đọc lại từng câu trả lời và đối chiếu với output |
+| Part 4.4 | Cost guard Redis | Viết `cost_guard_redis.py` dùng Lua để atomic; test 50 request song song (đúng 20 × $0.5 = $10 được qua) | Xem kết quả test |
+| Part 6 | Sửa TODO tới PASS | Viết toàn bộ `app/*.py`, Dockerfile, compose, config deploy; chạy script chấm (11/12 trên Windows) và kiểm tiêu chí SIGTERM trong container Linux | Đọc code; script chấm không bị sửa |
+| CP6 | Deploy | Thử Railway (trial hết hạn) → chuyển sang Render, sửa `render.yaml`, commit + push (khi tôi đồng ý), kiểm tra URL | Tự đăng nhập Railway, cài GitHub App, tạo Blueprint trên Render, tự lấy `AGENT_API_KEY` và chạy 4 lệnh test (key không gửi qua AI) |
+| Part 7 | Benchmark + observability | Chạy load test / eval, sửa `KNOWLEDGE_BASE` (không sửa `golden_dataset.jsonl`), viết job CI, chạy Locust + 5 thí nghiệm, đo thời gian alert bằng Prometheus API, tìm trace bằng Jaeger API; sửa lỗi `PYTHONUSERBASE` trong Dockerfile của stack | Tự chụp ảnh Grafana / Jaeger / Prometheus; số trong `BENCHMARK_REPORT.md` lấy từ file JSON/CSV trong `reports/` và `benchmark-results/` |
+
+Không dùng AI để bịa số đo: mọi con số trong bài đều lấy từ lệnh đã chạy và file report đã nộp.
